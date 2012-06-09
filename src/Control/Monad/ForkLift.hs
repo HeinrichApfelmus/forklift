@@ -77,7 +77,7 @@ newForkLift unlift = do
     channel <- newMyChanIO
     let loop  = forever . join . liftIO $ readMyChan channel
     mask $ \restore -> forkIO $ do
-        (restore $ unlift loop) `finally` closeMyChan channel
+        (restore $ unlift loop) `finally` (closeMyChan channel)
     return $ ForkLift channel
 
 
