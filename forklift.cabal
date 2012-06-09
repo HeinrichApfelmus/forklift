@@ -1,0 +1,43 @@
+Name:               forklift
+Version:            0.1.0.0
+Synopsis:           Perform arbitrary monadic computations in a worker thread.
+Description:
+  Sometimes, you have a monadic computation @ComplicatedMonad a@ and
+  you wish that it were an @IO a@ instead.
+  The /forklift/ pattern makes your wish come true in some cases.
+  .
+  More precisely, the monadic computation is sent to a worker thread
+  which performs the computation and sends back the result.
+  .
+  This pattern is useful when implementing web applications.
+  Often, the business logic is witten in one monad,
+  while the web framework uses another, incompatible monad.
+  The forklift pattern allows you to bridge the two.
+  .
+  See also
+  <http://apfelmus.nfshost.com/blog/2012/06/07-forklift.html>
+  
+Category:           Control, Monads, Concurrency
+License:            BSD3
+License-file:       LICENSE
+Author:             Heinrich Apfelmus
+Maintainer:         Heinrich Apfelmus <apfelmus quantentunnel de>
+Copyright:          (c) Heinrich Apfelmus 2012
+Homepage:           http://github.com/HeinrichApfelmus/forklift
+Stability:          Provisional
+
+build-type:         Simple
+cabal-version:      >= 1.6
+extra-source-files: CHANGELOG
+                    
+source-repository head
+    type:           git
+    location:       git://github.com/HeinrichApfelmus/forklift.git
+
+Library
+    hs-source-dirs:     src
+    build-depends:      base == 4.* , transformers >= 0.2 && < 0.4,
+                        stm == 2.2.*
+    extensions:         DeriveDataTypeable
+    exposed-modules:    Control.Monad.ForkLift
+
