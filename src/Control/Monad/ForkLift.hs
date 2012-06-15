@@ -19,10 +19,10 @@ import Data.Dynamic
 import Data.IORef hiding (readIORef, writeIORef)
 import Control.Applicative
 import Control.Concurrent
+import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
-import System.Mem.Weak
 
 {-----------------------------------------------------------------------------
     Documentation
@@ -80,8 +80,8 @@ newForkLift unlift = do
     let loop  = forever $ do
         Question ma var <- liftIO $ nextQuestion dr
         a <- ma
-        liftIO $ putMVar var (Just a)
-    forkIO $ unlift loop `finally` closeOffice dr
+        liftIO $ atomically $ putTMVar var (Just a)
+    forkIO $ unlift loop `finally` (closeOffice dr)
     return $ ForkLift dr
 
 -- | The 'ForkLift' thread has died and is unable to return a result.
@@ -94,9 +94,9 @@ instance Exception ForkLiftBroken
 -- cannot be obtained because the 'ForkLift' thread has died.
 carry :: MonadIO m => ForkLift m -> m a -> IO a
 carry (ForkLift dr) action = do
-    var <- newEmptyMVar
+    var <- newEmptyTMVarIO
     askQuestion dr $ Question action var
-    ma <- takeMVar var
+    ma <- atomically $ takeTMVar var
     case ma of
         Nothing -> throw ForkLiftBroken
         Just a  -> return a
@@ -104,7 +104,7 @@ carry (ForkLift dr) action = do
 -- | Send an action to the 'ForkLift' thread, but do not wait for the result.
 carryAway :: ForkLift m -> m () -> IO ()
 carryAway (ForkLift dr) action =
-    askQuestion dr . Question action =<< newEmptyMVar
+    askQuestion dr . Question action =<< newEmptyTMVarIO
 
 
 {-----------------------------------------------------------------------------
@@ -112,43 +112,37 @@ carryAway (ForkLift dr) action =
 ------------------------------------------------------------------------------}
 -- Dr. Sommer answers questions in a different thread.
 
-data Question m = forall a. Question (m a) (MVar (Maybe a))
+data Question m = forall a. Question (m a) (TMVar (Maybe a))
 data DrSommer m = DrSommer
-    { latest  :: IORef (Maybe (Question m))
-    , closed  :: IORef Bool
-    , channel :: Chan (Question m)
+    { latest  :: TVar (Maybe (Question m))
+    , closed  :: TVar Bool
+    , channel :: TChan (Question m)
     }
 
--- concurrent IORef manipulation
-readIORef  ref   = atomicModifyIORef ref (\x -> (x,x ))
-writeIORef ref x = atomicModifyIORef ref (\_ -> (x,()))
-
 newDrSommer :: IO (DrSommer m)
-newDrSommer = DrSommer <$> newIORef Nothing <*> newIORef False <*> newChan
+newDrSommer = DrSommer <$> newTVarIO Nothing <*> newTVarIO False <*> newTChanIO
 
 askQuestion :: DrSommer m -> Question m -> IO ()
-askQuestion dr q = do
-    b <- readIORef (closed dr)
+askQuestion dr q = atomically $ do
+    b <- readTVar (closed dr)
     if b
         then throw ForkLiftBroken
-        else writeChan (channel dr) q
-        -- race condition: question written to channel though it won't be cleared
+        else writeTChan (channel dr) q
 
 nextQuestion :: DrSommer m -> IO (Question m)
-nextQuestion dr = do
-    q <- readChan (channel dr)
-    writeIORef (latest dr) (Just q)
+nextQuestion dr = atomically $ do
+    q <- readTChan (channel dr)
+    writeTVar (latest dr) (Just q)
     return q
 
 closeOffice :: DrSommer m -> IO ()
-closeOffice dr = do
-        print "Closing!"
-        writeIORef (closed dr) True
-        readIORef (latest dr) >>= maybe (return ()) (unGetChan (channel dr))
-        whileM (isEmptyChan $ channel dr) $ 
-            readChan (channel dr) >>= closeQuestion
+closeOffice dr = atomically $ do
+        writeTVar (closed dr) True
+        readTVar (latest dr) >>= maybe (return ()) (unGetTChan (channel dr))
+        whileM (not <$> isEmptyTChan (channel dr)) $ 
+            readTChan (channel dr) >>= closeQuestion
     where
-    closeQuestion (Question _ answer) = putMVar answer Nothing
+    closeQuestion (Question _ answer) = putTMVar answer Nothing
 
 whileM mb f = do b <- mb; when b (f >> whileM mb f)
 
