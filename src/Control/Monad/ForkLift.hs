@@ -1,7 +1,7 @@
 {-----------------------------------------------------------------------------
     forklift
 ------------------------------------------------------------------------------}
-{-# LANGUAGE DeriveDataTypeable #-}
+{-# LANGUAGE DeriveDataTypeable, ExistentialQuantification #-}
 module Control.Monad.ForkLift (
     -- * Synopsis
     -- $intro
@@ -16,11 +16,13 @@ module Control.Monad.ForkLift (
     ) where
 
 import Data.Dynamic
+import Data.IORef hiding (readIORef, writeIORef)
+import Control.Applicative
 import Control.Concurrent
-import Control.Concurrent.STM
 import Control.Exception
 import Control.Monad
 import Control.Monad.IO.Class
+import System.Mem.Weak
 
 {-----------------------------------------------------------------------------
     Documentation
@@ -60,7 +62,7 @@ Example using the state monad transformer.
     Code
 ------------------------------------------------------------------------------}
 -- | A worker thread that evaluates computations from the monad @m@ in sequence.
-newtype ForkLift m = ForkLift (MyChan (m ()))
+newtype ForkLift m = ForkLift (DrSommer m)
 
 -- | Create a new 'ForkLift'.
 -- This will a spawn a new worker thread which
@@ -74,12 +76,13 @@ newtype ForkLift m = ForkLift (MyChan (m ()))
 -- Note: The thread will stop when the ForkLift is garbage collected.
 newForkLift :: MonadIO m => (m () -> IO ()) -> IO (ForkLift m)
 newForkLift unlift = do
-    channel <- newMyChanIO
-    let loop  = forever . join . liftIO $ readMyChan channel
-    mask $ \restore -> forkIO $ do
-        (restore $ unlift loop) `finally` (closeMyChan channel)
-    return $ ForkLift channel
-
+    dr <- newDrSommer
+    let loop  = forever $ do
+        Question ma var <- liftIO $ nextQuestion dr
+        a <- ma
+        liftIO $ putMVar var (Just a)
+    forkIO $ unlift loop `finally` closeOffice dr
+    return $ ForkLift dr
 
 -- | The 'ForkLift' thread has died and is unable to return a result.
 data ForkLiftBroken = ForkLiftBroken deriving (Show, Typeable)
@@ -90,42 +93,62 @@ instance Exception ForkLiftBroken
 -- Note: A 'ForkLiftBroken' exception will be thrown when the result
 -- cannot be obtained because the 'ForkLift' thread has died.
 carry :: MonadIO m => ForkLift m -> m a -> IO a
-carry (ForkLift channel) action = do
-    ref <- newEmptyMVar
-    
-    -- throws an exception when the channel is not available
-    writeMyChan channel $ liftIO . putMVar ref =<< action
-    
-    -- throws an exception when the channel is closed
-    -- and hence the MVar is garbage collected
-    mapException (\BlockedIndefinitelyOnMVar -> ForkLiftBroken) $
-        takeMVar ref
+carry (ForkLift dr) action = do
+    var <- newEmptyMVar
+    askQuestion dr $ Question action var
+    ma <- takeMVar var
+    case ma of
+        Nothing -> throw ForkLiftBroken
+        Just a  -> return a
 
 -- | Send an action to the 'ForkLift' thread, but do not wait for the result.
 carryAway :: ForkLift m -> m () -> IO ()
-carryAway (ForkLift channel) action = writeMyChan channel action
+carryAway (ForkLift dr) action =
+    askQuestion dr . Question action =<< newEmptyMVar
+
 
 {-----------------------------------------------------------------------------
-    Utilities
+    Utility functions for communication
 ------------------------------------------------------------------------------}
--- a concurrent channel that can be closed
-type MyChan a = TVar (Maybe (TChan a))
+-- Dr. Sommer answers questions in a different thread.
 
-newMyChanIO :: IO (MyChan a)
-newMyChanIO = newTVarIO =<< liftM Just newTChanIO
+data Question m = forall a. Question (m a) (MVar (Maybe a))
+data DrSommer m = DrSommer
+    { latest  :: IORef (Maybe (Question m))
+    , closed  :: IORef Bool
+    , channel :: Chan (Question m)
+    }
 
-writeMyChan :: MyChan a -> a -> IO ()
-writeMyChan myc x = do
-    err <- atomically $ do
-        mc <- readTVar myc
-        case mc of
-            Nothing -> return True
-            Just c  -> do writeTChan c x; return False
-    when err $ throw ForkLiftBroken
+-- concurrent IORef manipulation
+readIORef  ref   = atomicModifyIORef ref (\x -> (x,x ))
+writeIORef ref x = atomicModifyIORef ref (\_ -> (x,()))
 
-readMyChan  :: MyChan a -> IO a
-readMyChan myc = atomically $ (\(Just c) -> readTChan c) =<< readTVar myc
+newDrSommer :: IO (DrSommer m)
+newDrSommer = DrSommer <$> newIORef Nothing <*> newIORef False <*> newChan
 
-closeMyChan :: MyChan a -> IO ()
-closeMyChan myc = atomically $ writeTVar myc Nothing
+askQuestion :: DrSommer m -> Question m -> IO ()
+askQuestion dr q = do
+    b <- readIORef (closed dr)
+    if b
+        then throw ForkLiftBroken
+        else writeChan (channel dr) q
+        -- race condition: question written to channel though it won't be cleared
+
+nextQuestion :: DrSommer m -> IO (Question m)
+nextQuestion dr = do
+    q <- readChan (channel dr)
+    writeIORef (latest dr) (Just q)
+    return q
+
+closeOffice :: DrSommer m -> IO ()
+closeOffice dr = do
+        print "Closing!"
+        writeIORef (closed dr) True
+        readIORef (latest dr) >>= maybe (return ()) (unGetChan (channel dr))
+        whileM (isEmptyChan $ channel dr) $ 
+            readChan (channel dr) >>= closeQuestion
+    where
+    closeQuestion (Question _ answer) = putMVar answer Nothing
+
+whileM mb f = do b <- mb; when b (f >> whileM mb f)
 
